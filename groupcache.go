@@ -25,18 +25,18 @@ limitations under the License.
 package groupcache
 
 import (
-	"context"
-	"errors"
-	"github.com/mailgun/groupcache/v2/singleflight"
-	"strconv"
-	"sync"
-	"sync/atomic"
-	"time"
+    "context"
+    "errors"
+    "github.com/mailgun/groupcache/v2/singleflight"
+    "strconv"
+    "sync"
+    "sync/atomic"
+    "time"
 
-	pb "github.com/mailgun/groupcache/v2/groupcachepb"
-	"github.com/mailgun/groupcache/v2/lru"
+    pb "github.com/mailgun/groupcache/v2/groupcachepb"
 
-	"go.uber.org/zap"
+    "github.com/dgraph-io/ristretto"
+    "go.uber.org/zap"
 )
 
 var logger *zap.Logger
@@ -90,7 +90,7 @@ func GetGroup(name string) *Group {
 //
 // The group name must be unique for each getter.
 func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
-	return newGroup(name, cacheBytes, getter, nil)
+	return newGroup(name, cacheBytes, getter, nil, false)
 }
 
 // DeregisterGrorup removes group from group pool
@@ -101,7 +101,7 @@ func DeregisterGroup(name string) {
 }
 
 // If peers is nil, the peerPicker is called via a sync.Once to initialize it.
-func newGroup(name string, cacheBytes int64, getter Getter, peers PeerPicker) *Group {
+func newGroup(name string, cacheBytes int64, getter Getter, peers PeerPicker, cacheMetrics bool) *Group {
 	if getter == nil {
 		panic("nil Getter")
 	}
@@ -111,19 +111,59 @@ func newGroup(name string, cacheBytes int64, getter Getter, peers PeerPicker) *G
 	if _, dup := groups[name]; dup {
 		panic("duplicate registration of group " + name)
 	}
-	g := &Group{
-		name:        name,
-		getter:      getter,
-		peers:       peers,
-		cacheBytes:  cacheBytes,
-		loadGroup:   &singleflight.Group{},
-		removeGroup: &singleflight.Group{},
-	}
-	if fn := newGroupHook; fn != nil {
-		fn(g)
-	}
-	groups[name] = g
-	return g
+
+    var mainCache *ristretto.Cache
+    var hotCache *ristretto.Cache
+    var err error
+
+    g := &Group{
+        name:        name,
+        getter:      getter,
+        peers:       peers,
+        loadGroup:   &singleflight.Group{},
+        removeGroup: &singleflight.Group{},
+        mainCache:   mainCache,
+        hotCache:    hotCache,
+    }
+
+    err = g.updateCacheSize(cacheBytes, cacheMetrics)
+    if err != nil {
+        panic(err)
+    }
+
+    if fn := newGroupHook; fn != nil {
+        fn(g)
+    }
+    groups[name] = g
+    return g
+}
+
+// not thread safe, for init and tests only
+func (g *Group) updateCacheSize(cacheBytes int64, cacheMetrics bool) error {
+    g.cacheBytes = cacheBytes
+
+    var err error
+    if cacheBytes > 0 {
+        g.mainCache, err = ristretto.NewCache(&ristretto.Config{
+            NumCounters: 100_000,
+            MaxCost:     cacheBytes,
+            BufferItems: 64,
+            Metrics:     cacheMetrics,
+        })
+        if err != nil {
+            panic(err)
+        }
+        g.hotCache, err = ristretto.NewCache(&ristretto.Config{
+            NumCounters: 10_000,
+            MaxCost:     cacheBytes / 10,
+            BufferItems: 64,
+            Metrics:     cacheMetrics,
+        })
+    } else {
+        g.mainCache = nil
+        g.hotCache = nil
+    }
+    return err
 }
 
 // newGroupHook, if non-nil, is called right after a new group is created.
@@ -166,7 +206,7 @@ type Group struct {
 	// (amongst its peers) is authoritative. That is, this cache
 	// contains keys which consistent hash on to this process's
 	// peer number.
-	mainCache cache
+	mainCache *ristretto.Cache
 
 	// hotCache contains keys/values for which this peer is not
 	// authoritative (otherwise they would be in mainCache), but
@@ -176,7 +216,7 @@ type Group struct {
 	// network card could become the bottleneck on a popular key.
 	// This cache is used sparingly to maximize the total number
 	// of key/value pairs that can be stored globally.
-	hotCache cache
+	hotCache *ristretto.Cache
 
 	// loadGroup ensures that each key is only fetched once
 	// (either locally or remotely), regardless of the number of
@@ -204,7 +244,6 @@ type flightGroup interface {
 // Stats are per-group statistics.
 type Stats struct {
 	Gets                     AtomicInt // any Get request, including from peers
-	CacheHits                AtomicInt // either cache was good
 	GetFromPeersLatencyLower AtomicInt // slowest duration to request value from peers
 	PeerLoads                AtomicInt // either remote load or remote cache hit (not an error)
 	PeerErrors               AtomicInt
@@ -232,10 +271,9 @@ func (g *Group) Get(ctx context.Context, key string, dest Sink) error {
 	if dest == nil {
 		return errors.New("groupcache: nil dest Sink")
 	}
-	value, cacheHit := g.lookupCache(key)
 
+	value, cacheHit := g.lookupCache(key)
 	if cacheHit {
-		g.Stats.CacheHits.Add(1)
 		return setSinkView(dest, value)
 	}
 
@@ -243,8 +281,9 @@ func (g *Group) Get(ctx context.Context, key string, dest Sink) error {
 	// track of whether the dest was already populated. One caller
 	// (if local) will set this; the losers will not. The common
 	// case will likely be one caller.
-	destPopulated := false
-	value, destPopulated, err := g.load(ctx, key, dest)
+	var destPopulated bool
+    var err error
+	value, destPopulated, err = g.load(ctx, key, dest)
 	if err != nil {
 		return err
 	}
@@ -329,7 +368,6 @@ func (g *Group) load(ctx context.Context, key string, dest Sink) (value ByteView
 		// 2: loadGroup.Do("key", fn)
 		// 2: fn()
 		if value, cacheHit := g.lookupCache(key); cacheHit {
-			g.Stats.CacheHits.Add(1)
 			return value, nil
 		}
 		g.Stats.LoadsDeduped.Add(1)
@@ -379,7 +417,12 @@ func (g *Group) load(ctx context.Context, key string, dest Sink) (value ByteView
 		}
 		g.Stats.LocalLoads.Add(1)
 		destPopulated = true // only one caller of load gets this return value
-		g.populateCache(key, value, &g.mainCache)
+        expire := value.Expire()
+        var ttl time.Duration
+        if !expire.IsZero() {
+            ttl = expire.Sub(time.Now())
+        }
+        g.populateCache(key, value, g.mainCache, ttl)
 		return value, nil
 	})
 	if err == nil {
@@ -408,9 +451,11 @@ func (g *Group) getFromPeer(ctx context.Context, peer ProtoGetter, key string) (
 	}
 
 	var expire time.Time
+    var ttl time.Duration
 	if res.Expire != nil && *res.Expire != 0 {
 		expire = time.Unix(*res.Expire/int64(time.Second), *res.Expire%int64(time.Second))
-		if time.Now().After(expire) {
+        ttl = expire.Sub(time.Now())
+		if ttl <= 0 {
 			return ByteView{}, errors.New("peer returned expired value")
 		}
 	}
@@ -418,7 +463,7 @@ func (g *Group) getFromPeer(ctx context.Context, peer ProtoGetter, key string) (
 	value := ByteView{b: res.Value, e: expire}
 
 	// Always populate the hot cache
-	g.populateCache(key, value, &g.hotCache)
+	g.populateCache(key, value, g.hotCache, ttl)
 	return value, nil
 }
 
@@ -430,16 +475,22 @@ func (g *Group) removeFromPeer(ctx context.Context, peer ProtoGetter, key string
 	return peer.Remove(ctx, req)
 }
 
-func (g *Group) lookupCache(key string) (value ByteView, ok bool) {
+func (g *Group) lookupCache(key string) (ByteView, bool) {
 	if g.cacheBytes <= 0 {
-		return
+		return ByteView{}, false
 	}
-	value, ok = g.mainCache.get(key)
-	if ok {
-		return
+
+    g.mainCache.Wait()
+	value, ok := g.mainCache.Get(key)
+	if !ok {
+        g.hotCache.Wait()
+        value, ok = g.hotCache.Get(key)
+        if !ok {
+            return ByteView{}, false
+        }
 	}
-	value, ok = g.hotCache.get(key)
-	return
+
+    return value.(ByteView), ok
 }
 
 func (g *Group) localRemove(key string) {
@@ -450,33 +501,15 @@ func (g *Group) localRemove(key string) {
 
 	// Ensure no requests are in flight
 	g.loadGroup.Lock(func() {
-		g.hotCache.remove(key)
-		g.mainCache.remove(key)
+		g.hotCache.Del(key)
+		g.mainCache.Del(key)
 	})
 }
 
-func (g *Group) populateCache(key string, value ByteView, cache *cache) {
-	if g.cacheBytes <= 0 {
-		return
-	}
-	cache.add(key, value)
-
-	// Evict items from cache(s) if necessary.
-	for {
-		mainBytes := g.mainCache.bytes()
-		hotBytes := g.hotCache.bytes()
-		if mainBytes+hotBytes <= g.cacheBytes {
-			return
-		}
-
-		// TODO(bradfitz): this is good-enough-for-now logic.
-		// It should be something based on measurements and/or
-		// respecting the costs of different resources.
-		victim := &g.mainCache
-		if hotBytes > mainBytes/8 {
-			victim = &g.hotCache
-		}
-		victim.removeOldest()
+func (g *Group) populateCache(key string, value ByteView, cache *ristretto.Cache, ttl time.Duration) {
+	if g.cacheBytes > 0 {
+        cache.SetWithTTL(key, value, int64(value.Len()), ttl)
+        cache.Wait()
 	}
 }
 
@@ -495,105 +528,15 @@ const (
 )
 
 // CacheStats returns stats about the provided cache within the group.
-func (g *Group) CacheStats(which CacheType) CacheStats {
+func (g *Group) CacheStats(which CacheType) *ristretto.Metrics {
 	switch which {
 	case MainCache:
-		return g.mainCache.stats()
+		return g.mainCache.Metrics
 	case HotCache:
-		return g.hotCache.stats()
+        return g.hotCache.Metrics
 	default:
-		return CacheStats{}
+		panic("unknown cache type")
 	}
-}
-
-// cache is a wrapper around an *lru.Cache that adds synchronization,
-// makes values always be ByteView, and counts the size of all keys and
-// values.
-type cache struct {
-	mu         sync.RWMutex
-	nbytes     int64 // of all keys and values
-	lru        *lru.Cache
-	nhit, nget int64
-	nevict     int64 // number of evictions
-}
-
-func (c *cache) stats() CacheStats {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return CacheStats{
-		Bytes:     c.nbytes,
-		Items:     c.itemsLocked(),
-		Gets:      c.nget,
-		Hits:      c.nhit,
-		Evictions: c.nevict,
-	}
-}
-
-func (c *cache) add(key string, value ByteView) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.lru == nil {
-		c.lru = &lru.Cache{
-			OnEvicted: func(key lru.Key, value interface{}) {
-				val := value.(ByteView)
-				c.nbytes -= int64(len(key.(string))) + int64(val.Len())
-				c.nevict++
-			},
-		}
-	}
-	c.lru.Add(key, value, value.Expire())
-	c.nbytes += int64(len(key)) + int64(value.Len())
-}
-
-func (c *cache) get(key string) (value ByteView, ok bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.nget++
-	if c.lru == nil {
-		return
-	}
-	vi, ok := c.lru.Get(key)
-	if !ok {
-		return
-	}
-	c.nhit++
-	return vi.(ByteView), true
-}
-
-func (c *cache) remove(key string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.lru == nil {
-		return
-	}
-	c.lru.Remove(key)
-}
-
-func (c *cache) removeOldest() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	if c.lru != nil {
-		c.lru.RemoveOldest()
-	}
-}
-
-func (c *cache) bytes() int64 {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.nbytes
-}
-
-func (c *cache) items() int64 {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.itemsLocked()
-}
-
-func (c *cache) itemsLocked() int64 {
-	if c.lru == nil {
-		return 0
-	}
-	return int64(c.lru.Len())
 }
 
 // An AtomicInt is an int64 to be accessed atomically.

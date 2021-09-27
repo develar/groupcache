@@ -49,23 +49,29 @@ var (
 	cacheFills AtomicInt
 )
 
+const MB = 1024 * 1024
+
 const (
 	stringGroupName = "string-group"
 	protoGroupName  = "proto-group"
 	expireGroupName = "expire-group"
-	testMessageType = "google3/net/groupcache/go/test_proto.TestMessage"
 	fromChan        = "from-chan"
-	cacheSize       = 1 << 20
+    // 1 MB
+	cacheSize       = 2 * MB
 )
 
+var stringGroupRaw *Group
+
 func testSetup() {
-	stringGroup = NewGroup(stringGroupName, cacheSize, GetterFunc(func(_ context.Context, key string, dest Sink) error {
+    stringGroupRaw = newGroup(stringGroupName, cacheSize, GetterFunc(func(_ context.Context, key string, dest Sink) error {
 		if key == fromChan {
 			key = <-stringc
 		}
 		cacheFills.Add(1)
-		return dest.SetString("ECHO:"+key, time.Time{})
-	}))
+        s := "ECHO:" + key
+        return dest.SetString(s, time.Time{})
+	}), nil, true)
+    stringGroup = stringGroupRaw
 
 	protoGroup = NewGroup(protoGroupName, cacheSize, GetterFunc(func(_ context.Context, key string, dest Sink) error {
 		if key == fromChan {
@@ -187,7 +193,7 @@ func TestCaching(t *testing.T) {
 		}
 	})
 	if fills != 1 {
-		t.Errorf("expected 1 cache fill; got %d", fills)
+		t.Errorf("expected 1 cache fill; got %d, %s %s", fills, stringGroupRaw.mainCache.Metrics, stringGroupRaw.hotCache.Metrics.String())
 	}
 }
 
@@ -206,46 +212,6 @@ func TestCachingExpire(t *testing.T) {
 	})
 	if fills != 2 {
 		t.Errorf("expected 2 cache fill; got %d", fills)
-	}
-}
-
-func TestCacheEviction(t *testing.T) {
-	once.Do(testSetup)
-	testKey := "TestCacheEviction-key"
-	getTestKey := func() {
-		var res string
-		for i := 0; i < 10; i++ {
-			if err := stringGroup.Get(dummyCtx, testKey, StringSink(&res)); err != nil {
-				t.Fatal(err)
-			}
-		}
-	}
-	fills := countFills(getTestKey)
-	if fills != 1 {
-		t.Fatalf("expected 1 cache fill; got %d", fills)
-	}
-
-	g := stringGroup.(*Group)
-	evict0 := g.mainCache.nevict
-
-	// Trash the cache with other keys.
-	var bytesFlooded int64
-	// cacheSize/len(testKey) is approximate
-	for bytesFlooded < cacheSize+1024 {
-		var res string
-		key := fmt.Sprintf("dummy-key-%d", bytesFlooded)
-		stringGroup.Get(dummyCtx, key, StringSink(&res))
-		bytesFlooded += int64(len(key) + len(res))
-	}
-	evicts := g.mainCache.nevict - evict0
-	if evicts <= 0 {
-		t.Errorf("evicts = %v; want more than 0", evicts)
-	}
-
-	// Test that the key is gone.
-	fills = countFills(getTestKey)
-	if fills != 1 {
-		t.Fatalf("expected 1 cache fill after cache trashing; got %d", fills)
 	}
 }
 
@@ -302,7 +268,7 @@ func TestPeers(t *testing.T) {
 		localHits++
 		return dest.SetString("got:"+key, time.Time{})
 	}
-	testGroup := newGroup("TestPeers-group", cacheSize, GetterFunc(getter), peerList)
+	testGroup := newGroup("TestPeers-group", cacheSize, GetterFunc(getter), peerList, true)
 	run := func(name string, n int, wantSummary string) {
 		// Reset counters
 		localHits = 0
@@ -331,11 +297,11 @@ func TestPeers(t *testing.T) {
 		}
 	}
 	resetCacheSize := func(maxBytes int64) {
-		g := testGroup
-		g.cacheBytes = maxBytes
-		g.mainCache = cache{}
-		g.hotCache = cache{}
-	}
+        err := testGroup.updateCacheSize(maxBytes, true)
+        if err != nil {
+            t.Error(err)
+        }
+    }
 
 	// Base case; peers all up, with no problems.
 	resetCacheSize(1 << 20)
@@ -384,7 +350,10 @@ func TestAllocatingByteSliceTarget(t *testing.T) {
 	sink := AllocatingByteSliceSink(&dst)
 
 	inBytes := []byte("some bytes")
-	sink.SetBytes(inBytes, time.Time{})
+    err := sink.SetBytes(inBytes, time.Time{})
+    if err != nil {
+        t.Error(err)
+    }
 	if want := "some bytes"; string(dst) != want {
 		t.Errorf("SetBytes resulted in %q; want %q", dst, want)
 	}
@@ -432,7 +401,7 @@ func TestNoDedup(t *testing.T) {
 	const testval = "testval"
 	g := newGroup("testgroup", 1024, GetterFunc(func(_ context.Context, key string, dest Sink) error {
 		return dest.SetString(testval, time.Time{})
-	}), nil)
+	}), nil, true)
 
 	orderedGroup := &orderedFlightGroup{
 		stage1: make(chan bool),
@@ -443,9 +412,9 @@ func TestNoDedup(t *testing.T) {
 	// loadGroup.Do is entered for each concurrent request.
 	g.loadGroup = orderedGroup
 
-	// Issue two idential requests concurrently.  Since the cache is
+	// Issue two identical requests concurrently.  Since the cache is
 	// empty, it will miss.  Both will enter load(), but we will only
-	// allow one at a time to enter singleflight.Do, so the callback
+	// allow one at a time to enter singleflight. Do, so the callback
 	// function will be called twice.
 	resc := make(chan string, 2)
 	for i := 0; i < 2; i++ {
@@ -474,16 +443,17 @@ func TestNoDedup(t *testing.T) {
 	}
 
 	const wantItems = 1
-	if g.mainCache.items() != wantItems {
-		t.Errorf("mainCache has %d items, want %d", g.mainCache.items(), wantItems)
+	if g.mainCache.Metrics.KeysAdded() != wantItems {
+		t.Errorf("mainCache has %d items, want %d", g.mainCache.Metrics.KeysAdded(), wantItems)
 	}
 
 	// If the singleflight callback doesn't double-check the cache again
 	// upon entry, we would increment nbytes twice but the entry would
 	// only be in the cache once.
-	const wantBytes = int64(len(testkey) + len(testval))
-	if g.mainCache.nbytes != wantBytes {
-		t.Errorf("cache has %d bytes, want %d", g.mainCache.nbytes, wantBytes)
+	//const wantBytes = uint64(len(testkey) + len(testval))
+	const wantBytes = 63
+	if g.mainCache.Metrics.CostAdded() != wantBytes {
+		t.Errorf("cache has %d bytes, want %d", g.mainCache.Metrics.CostAdded(), wantBytes)
 	}
 }
 
@@ -514,7 +484,7 @@ func TestContextDeadlineOnPeer(t *testing.T) {
 	getter := func(_ context.Context, key string, dest Sink) error {
 		return dest.SetString("got:"+key, time.Time{})
 	}
-	testGroup := newGroup("TestContextDeadlineOnPeer-group", cacheSize, GetterFunc(getter), peerList)
+	testGroup := newGroup("TestContextDeadlineOnPeer-group", cacheSize, GetterFunc(getter), peerList, true)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*300)
 	defer cancel()
