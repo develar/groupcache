@@ -17,19 +17,19 @@ limitations under the License.
 package groupcache
 
 import (
-	"bytes"
-	"context"
-	"fmt"
-	"io"
-	"io/ioutil"
-	"net/http"
-	"net/url"
-	"strings"
-	"sync"
+    "bytes"
+    "context"
+    "fmt"
+    "github.com/mailgun/groupcache/v2/consistent"
+    "io"
+    "io/ioutil"
+    "net/http"
+    "net/url"
+    "strings"
+    "sync"
 
-	"github.com/golang/protobuf/proto"
-	"github.com/mailgun/groupcache/v2/consistenthash"
-	pb "github.com/mailgun/groupcache/v2/groupcachepb"
+    "github.com/golang/protobuf/proto"
+    pb "github.com/mailgun/groupcache/v2/groupcachepb"
 )
 
 const defaultBasePath = "/_groupcache/"
@@ -44,9 +44,7 @@ type HTTPPool struct {
 	// opts specifies the options.
 	opts HTTPPoolOptions
 
-	mu          sync.Mutex // guards peers and httpGetters
-	peers       *consistenthash.Map
-	httpGetters map[string]*httpGetter // keyed by e.g. "http://10.0.0.2:8008"
+	peers *consistent.Consistent
 }
 
 // HTTPPoolOptions are the configurations of a HTTPPool.
@@ -58,10 +56,6 @@ type HTTPPoolOptions struct {
 	// Replicas specifies the number of key replicas on the consistent hash.
 	// If blank, it defaults to 50.
 	Replicas int
-
-	// HashFn specifies the hash function of the consistent hash.
-	// If blank, it defaults to crc32.ChecksumIEEE.
-	HashFn consistenthash.Hash
 
 	// Transport optionally specifies an http.RoundTripper for the client
 	// to use when it makes a request.
@@ -95,9 +89,13 @@ func NewHTTPPoolOpts(self string, o *HTTPPoolOptions) *HTTPPool {
 	}
 	httpPoolMade = true
 
+    basePath := defaultBasePath
+    if o != nil && o.BasePath != "" {
+        basePath = o.BasePath
+    }
+
 	p := &HTTPPool{
-		self:        self,
-		httpGetters: make(map[string]*httpGetter),
+		self: self + basePath,
 	}
 	if o != nil {
 		p.opts = *o
@@ -108,51 +106,59 @@ func NewHTTPPoolOpts(self string, o *HTTPPoolOptions) *HTTPPool {
 	if p.opts.Replicas == 0 {
 		p.opts.Replicas = defaultReplicas
 	}
-	p.peers = consistenthash.New(p.opts.Replicas, p.opts.HashFn)
+	p.peers = consistent.New(nil, createConsistentConfig(p.opts.Replicas))
 
 	RegisterPeerPicker(func() PeerPicker { return p })
 	return p
 }
 
+func createConsistentConfig(replicationFactor int) consistent.Config {
+	return consistent.Config{
+		PartitionCount:    271,
+		ReplicationFactor: replicationFactor,
+		Load:              1.25,
+		Logger:            logger,
+	}
+}
+
 // Set updates the pool's list of peers.
 // Each peer value should be a valid base URL,
 // for example "http://example.net:8000".
-func (p *HTTPPool) Set(peers ...string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	p.peers = consistenthash.New(p.opts.Replicas, p.opts.HashFn)
-	p.peers.Add(peers...)
-	p.httpGetters = make(map[string]*httpGetter, len(peers))
-	for _, peer := range peers {
-		p.httpGetters[peer] = &httpGetter{
+func (p *HTTPPool) Set(peerUrls ...string) {
+	peers := make([]consistent.Member, len(peerUrls))
+	for index, peerUrl := range peerUrls {
+		peers[index] = &httpGetter{
 			getTransport: p.opts.Transport,
-			baseURL:      peer + p.opts.BasePath,
+			url:          peerUrl + p.opts.BasePath,
 		}
 	}
+	p.peers.Set(peers)
 }
 
 // GetAll returns all the peers in the pool
 func (p *HTTPPool) GetAll() []ProtoGetter {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	var i int
-	res := make([]ProtoGetter, len(p.httpGetters))
-	for _, v := range p.httpGetters {
-		res[i] = v
+	members := p.peers.GetMembers()
+	result := make([]ProtoGetter, len(members))
+	for _, v := range members {
+		var ok bool
+		result[i], ok = v.(*httpGetter)
+		if !ok {
+			panic("cannot cast to httpGetter")
+		}
 		i++
 	}
-	return res
+	return result
 }
 
 func (p *HTTPPool) PickPeer(key string) (ProtoGetter, bool) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	if p.peers.IsEmpty() {
-		return nil, false
-	}
-	if peer := p.peers.Get(key); peer != p.self {
-		return p.httpGetters[peer], true
+	peer := p.peers.LocateKey([]byte(key))
+	if peer != nil && peer.String() != p.self {
+		peerImpl, ok := peer.(*httpGetter)
+		if !ok {
+			panic("cannot cast to httpGetter")
+		}
+		return peerImpl, true
 	}
 	return nil, false
 }
@@ -222,12 +228,16 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 type httpGetter struct {
 	getTransport func(context.Context) http.RoundTripper
-	baseURL      string
+	url          string
 }
 
 // GetURL
 func (p *httpGetter) GetURL() string {
-	return p.baseURL
+	return p.url
+}
+
+func (p httpGetter) String() string {
+	return p.url
 }
 
 var bufferPool = sync.Pool{
@@ -235,12 +245,7 @@ var bufferPool = sync.Pool{
 }
 
 func (h *httpGetter) makeRequest(ctx context.Context, method string, in *pb.GetRequest, out *http.Response) error {
-	u := fmt.Sprintf(
-		"%v%v/%v",
-		h.baseURL,
-		url.QueryEscape(in.GetGroup()),
-		url.QueryEscape(in.GetKey()),
-	)
+	u := h.url + url.QueryEscape(in.GetGroup()) + "/" + url.QueryEscape(in.GetKey())
 	req, err := http.NewRequestWithContext(ctx, method, u, nil)
 	if err != nil {
 		return err

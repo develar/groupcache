@@ -17,21 +17,21 @@ limitations under the License.
 package groupcache
 
 import (
-	"context"
-	"errors"
-	"flag"
-	"fmt"
-	"log"
-	"net"
-	"net/http"
-	"net/http/httptest"
-	"os"
-	"os/exec"
-	"strconv"
-	"strings"
-	"sync"
-	"testing"
-	"time"
+    "context"
+    "errors"
+    "flag"
+    "fmt"
+    "log"
+    "net"
+    "net/http"
+    "net/http/httptest"
+    "os"
+    "os/exec"
+    "strconv"
+    "strings"
+    "sync"
+    "testing"
+    "time"
 )
 
 var (
@@ -70,14 +70,17 @@ func TestHTTPPool(t *testing.T) {
 		cmd := exec.Command(os.Args[0],
 			"--test.run=TestHTTPPool",
 			"--test_peer_child",
-			"--test_peer_addrs="+strings.Join(childAddr, ","),
-			"--test_peer_index="+strconv.Itoa(i),
-			"--test_server_addr="+ts.URL,
-		)
-		cmds = append(cmds, cmd)
-		wg.Add(1)
-		if err := cmd.Start(); err != nil {
-			t.Fatal("failed to start child process: ", err)
+            "--test_peer_addrs="+strings.Join(childAddr, ","),
+            "--test_peer_index="+strconv.Itoa(i),
+            "--test_server_addr="+ts.URL,
+        )
+        cmd.Stdout = os.Stdout
+        cmd.Stderr = os.Stderr
+
+        cmds = append(cmds, cmd)
+        wg.Add(1)
+        if err := cmd.Start(); err != nil {
+            t.Fatal("failed to start child process: ", err)
 		}
 		go awaitAddrReady(t, childAddr[i], &wg)
 	}
@@ -177,7 +180,7 @@ func beChildForTestHTTPPool(t *testing.T) {
 	})
 	NewGroup("httpPoolTest", 1<<20, getter)
 
-	log.Fatal(http.ListenAndServe(addrs[*peerIndex], p))
+    log.Fatal(http.ListenAndServe(addrs[*peerIndex], p))
 }
 
 // This is racy. Another process could swoop in and steal the port between the

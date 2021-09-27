@@ -27,6 +27,7 @@ package groupcache
 import (
 	"context"
 	"errors"
+	"github.com/mailgun/groupcache/v2/singleflight"
 	"strconv"
 	"sync"
 	"sync/atomic"
@@ -34,13 +35,13 @@ import (
 
 	pb "github.com/mailgun/groupcache/v2/groupcachepb"
 	"github.com/mailgun/groupcache/v2/lru"
-	"github.com/mailgun/groupcache/v2/singleflight"
-	"github.com/sirupsen/logrus"
+
+	"go.uber.org/zap"
 )
 
-var logger *logrus.Entry
+var logger *zap.Logger
 
-func SetLogger(log *logrus.Entry) {
+func SetLogger(log *zap.Logger) {
 	logger = log
 }
 
@@ -92,7 +93,7 @@ func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
 	return newGroup(name, cacheBytes, getter, nil)
 }
 
-// DeregisterGroup removes group from group pool
+// DeregisterGrorup removes group from group pool
 func DeregisterGroup(name string) {
 	mu.Lock()
 	delete(groups, name)
@@ -356,11 +357,7 @@ func (g *Group) load(ctx context.Context, key string, dest Sink) (value ByteView
 			}
 
 			if logger != nil {
-				logger.WithFields(logrus.Fields{
-					"err":      err,
-					"key":      key,
-					"category": "groupcache",
-				}).Errorf("error retrieving key from peer '%s'", peer.GetURL())
+				logger.Error("error retrieving key from peer", zap.String("peer", peer.GetURL()), zap.Error(err), zap.String(key, key))
 			}
 
 			g.Stats.PeerErrors.Add(1)
