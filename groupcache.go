@@ -27,13 +27,13 @@ package groupcache
 import (
     "context"
     "errors"
-    "github.com/mailgun/groupcache/v2/singleflight"
+    "github.com/develar/groupcache/singleflight"
     "strconv"
     "sync"
     "sync/atomic"
     "time"
 
-    pb "github.com/mailgun/groupcache/v2/groupcachepb"
+    pb "github.com/develar/groupcache/groupcachepb"
 
     "github.com/dgraph-io/ristretto"
     "go.uber.org/zap"

@@ -20,7 +20,7 @@ import (
     "bytes"
     "context"
     "fmt"
-    "github.com/mailgun/groupcache/v2/consistent"
+    "github.com/develar/groupcache/consistent"
     "io"
     "io/ioutil"
     "net/http"
@@ -28,8 +28,8 @@ import (
     "strings"
     "sync"
 
+    pb "github.com/develar/groupcache/groupcachepb"
     "github.com/golang/protobuf/proto"
-    pb "github.com/mailgun/groupcache/v2/groupcachepb"
 )
 
 const defaultBasePath = "/_groupcache/"

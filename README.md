@@ -86,7 +86,7 @@ import (
     "log"
     "time"
 
-    "github.com/mailgun/groupcache/v2"
+    "github.com/develar/groupcache"
 )
 
 func ExampleUsage() {
