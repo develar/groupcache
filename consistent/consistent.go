@@ -64,7 +64,7 @@ import (
 )
 
 var (
-	//ErrInsufficientMemberCount represents an error which means there are not enough members to complete the task.
+	// ErrInsufficientMemberCount represents an error which means there are not enough members to complete the task.
 	ErrInsufficientMemberCount = errors.New("insufficient member count")
 )
 

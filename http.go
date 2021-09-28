@@ -17,19 +17,17 @@ limitations under the License.
 package groupcache
 
 import (
-    "bytes"
     "context"
     "fmt"
     "github.com/develar/groupcache/consistent"
-    "io"
     "io/ioutil"
     "net/http"
     "net/url"
     "strings"
-    "sync"
 
     pb "github.com/develar/groupcache/groupcachepb"
     "github.com/golang/protobuf/proto"
+    "github.com/valyala/bytebufferpool"
 )
 
 const defaultBasePath = "/_groupcache/"
@@ -240,10 +238,6 @@ func (p httpGetter) String() string {
 	return p.url
 }
 
-var bufferPool = sync.Pool{
-	New: func() interface{} { return new(bytes.Buffer) },
-}
-
 func (h *httpGetter) makeRequest(ctx context.Context, method string, in *pb.GetRequest, out *http.Response) error {
 	u := h.url + url.QueryEscape(in.GetGroup()) + "/" + url.QueryEscape(in.GetKey())
 	req, err := http.NewRequestWithContext(ctx, method, u, nil)
@@ -273,10 +267,9 @@ func (h *httpGetter) Get(ctx context.Context, in *pb.GetRequest, out *pb.GetResp
 	if res.StatusCode != http.StatusOK {
 		return fmt.Errorf("server returned: %v", res.Status)
 	}
-	b := bufferPool.Get().(*bytes.Buffer)
-	b.Reset()
-	defer bufferPool.Put(b)
-	_, err := io.Copy(b, res.Body)
+	b := bytebufferpool.Get()
+	defer bytebufferpool.Put(b)
+	_, err := b.ReadFrom(res.Body)
 	if err != nil {
 		return fmt.Errorf("reading response body: %v", err)
 	}
