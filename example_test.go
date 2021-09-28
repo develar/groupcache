@@ -1,12 +1,13 @@
 package groupcache_test
 
 import (
-	"context"
-	"fmt"
-	"log"
-	"time"
+    "context"
+    "fmt"
+    "github.com/develar/groupcache/examplepb"
+    "log"
+    "time"
 
-	"github.com/develar/groupcache"
+    "github.com/develar/groupcache"
 )
 
 func ExampleUsage() {
@@ -32,16 +33,15 @@ func ExampleUsage() {
 		defer server.Shutdown(context.Background())
 	*/
 
-	// Create a new group cache with a max cache size of 3MB
-	group := groupcache.NewGroup("users", 3000000, groupcache.GetterFunc(
-		func(ctx context.Context, id string, dest groupcache.Sink) error {
-
+	// Create a new group cache with a max cache size of 3 MB
+	group := groupcache.NewGroup("users", 30_00_000, groupcache.GetterFunc(
+		func(ctx context.Context, id string) (groupcache.Value, time.Time, error) {
 			// In a real scenario we might fetch the value from a database.
 			/*if user, err := fetchUserFromMongo(ctx, id); err != nil {
 				return err
 			}*/
 
-			user := User{
+			user := examplepb.User{
 				Id:      "12345",
 				Name:    "John Doe",
 				Age:     40,
@@ -49,21 +49,20 @@ func ExampleUsage() {
 			}
 
 			// Set the user in the groupcache to expire after 5 minutes
-			if err := dest.SetProto(&user, time.Now().Add(time.Minute*5)); err != nil {
-				return err
-			}
-			return nil
-		},
-	))
-
-	var user User
+			return &user, time.Now().Add(time.Minute*5), nil
+		}), func() groupcache.Value {
+        return &examplepb.User{}
+    })
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 
-	if err := group.Get(ctx, "12345", groupcache.ProtoSink(&user)); err != nil {
+    v, err := group.Get(ctx, "12345")
+	if err != nil {
 		log.Fatal(err)
 	}
+
+    user := v.(*examplepb.User)
 
 	fmt.Printf("-- User --\n")
 	fmt.Printf("Id: %s\n", user.Id)

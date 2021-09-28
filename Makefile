@@ -5,3 +5,7 @@ lint:
 
 test:
 	go test
+
+update-deps:
+	go get -d -u ./...
+	go mod tidy

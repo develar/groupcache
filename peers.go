@@ -25,7 +25,7 @@ import (
 
 // ProtoGetter is the interface that must be implemented by a peer.
 type ProtoGetter interface {
-	Get(context context.Context, group string, key string) ([]byte, time.Time, error)
+	Get(context context.Context, group string, key string, valueAllocator ValueAllocator) (Value, time.Time, error)
 	Remove(context context.Context, group string, key string) error
 	// GetURL returns the peer URL
 	GetURL() string

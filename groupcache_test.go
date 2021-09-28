@@ -19,24 +19,24 @@ limitations under the License.
 package groupcache
 
 import (
-	"context"
-	"errors"
-	"fmt"
-	"hash/crc32"
-	"reflect"
-	"sync"
-	"testing"
-	"time"
-	"unsafe"
+    "context"
+    "errors"
+    "fmt"
+    "go.uber.org/zap"
+    "hash/crc32"
+    "sync"
+    "testing"
+    "time"
+    "unsafe"
 
-	"github.com/golang/protobuf/proto"
+    "google.golang.org/protobuf/proto"
 
-	"github.com/develar/groupcache/testpb"
+    "github.com/develar/groupcache/testpb"
 )
 
 var (
 	once                                 sync.Once
-	stringGroup, protoGroup, expireGroup Getter
+	stringGroup, protoGroup, expireGroup *Group
 
 	stringc = make(chan string)
 
@@ -47,6 +47,11 @@ var (
 	// cacheFills function.
 	cacheFills AtomicInt
 )
+
+func init() {
+    logger, _ := zap.NewDevelopment()
+    SetLogger(logger)
+}
 
 const MB = 1024 * 1024
 
@@ -59,34 +64,33 @@ const (
 	cacheSize       = 2 * MB
 )
 
-var stringGroupRaw *Group
-
 func testSetup() {
-    stringGroupRaw = newGroup(stringGroupName, cacheSize, GetterFunc(func(_ context.Context, key string, dest Sink) error {
+    stringGroup = newGroup(stringGroupName, cacheSize, GetterFunc(func(_ context.Context, key string) (Value, time.Time, error) {
 		if key == fromChan {
 			key = <-stringc
 		}
 		cacheFills.Add(1)
         s := "ECHO:" + key
-        return dest.SetString(s, time.Time{})
-	}), nil, true)
-    stringGroup = stringGroupRaw
+        return &StringValue{Value: s}, time.Time{}, nil
+	}), StringValueAllocator, nil, true)
 
-	protoGroup = NewGroup(protoGroupName, cacheSize, GetterFunc(func(_ context.Context, key string, dest Sink) error {
-		if key == fromChan {
-			key = <-stringc
-		}
-		cacheFills.Add(1)
-		return dest.SetProto(&testpb.TestMessage{
-			Name: proto.String("ECHO:" + key),
-			City: proto.String("SOME-CITY"),
-		}, time.Time{})
-	}))
+    protoGroup = NewGroup(protoGroupName, cacheSize, GetterFunc(func(_ context.Context, key string) (Value, time.Time, error) {
+        if key == fromChan {
+            key = <-stringc
+        }
+        cacheFills.Add(1)
+        return &testpb.TestMessage{
+            Name: proto.String("ECHO:" + key),
+            City: proto.String("SOME-CITY"),
+        }, time.Time{}, nil
+    }), func() Value {
+        return &testpb.TestMessage{}
+    })
 
-	expireGroup = NewGroup(expireGroupName, cacheSize, GetterFunc(func(_ context.Context, key string, dest Sink) error {
-		cacheFills.Add(1)
-		return dest.SetString("ECHO:"+key, time.Now().Add(time.Millisecond*100))
-	}))
+    expireGroup = NewGroup(expireGroupName, cacheSize, GetterFunc(func(_ context.Context, key string) (Value, time.Time, error) {
+        cacheFills.Add(1)
+        return &StringValue{Value: "ECHO:"+key}, time.Now().Add(time.Millisecond*100), nil
+    }), StringValueAllocator)
 }
 
 // tests that a Getter's Get method is only called once with two
@@ -99,12 +103,14 @@ func TestGetDupSuppressString(t *testing.T) {
 	resc := make(chan string, 2)
 	for i := 0; i < 2; i++ {
 		go func() {
-			var s string
-			if err := stringGroup.Get(dummyCtx, fromChan, StringSink(&s)); err != nil {
+            v, err := stringGroup.Get(dummyCtx, fromChan)
+            //println("v: ", v, "err", err)
+			if err != nil {
 				resc <- "ERROR:" + err.Error()
 				return
 			}
-			resc <- s
+            s := v.(*StringValue).Value
+            resc <- s
 		}()
 	}
 
@@ -141,9 +147,10 @@ func TestGetDupSuppressProto(t *testing.T) {
 	resc := make(chan *testpb.TestMessage, 2)
 	for i := 0; i < 2; i++ {
 		go func() {
-			tm := new(testpb.TestMessage)
-			if err := protoGroup.Get(dummyCtx, fromChan, ProtoSink(tm)); err != nil {
-				tm.Name = proto.String("ERROR:" + err.Error())
+            v, err := protoGroup.Get(dummyCtx, fromChan)
+            tm := v.(*testpb.TestMessage)
+			if err != nil {
+                tm.Name = proto.String("ERROR:" + err.Error())
 			}
 			resc <- tm
 		}()
@@ -166,8 +173,10 @@ func TestGetDupSuppressProto(t *testing.T) {
 	for i := 0; i < 2; i++ {
 		select {
 		case v := <-resc:
-			if !reflect.DeepEqual(v, want) {
-				t.Errorf(" Got: %v\nWant: %v", proto.CompactTextString(v), proto.CompactTextString(want))
+            a := v.String()
+            b := want.String()
+            if a != b {
+				t.Errorf(" Got: %s\nWant: %s", a, b)
 			}
 		case <-time.After(5 * time.Second):
 			t.Errorf("timeout waiting on getter #%d of 2", i+1)
@@ -185,14 +194,13 @@ func TestCaching(t *testing.T) {
 	once.Do(testSetup)
 	fills := countFills(func() {
 		for i := 0; i < 10; i++ {
-			var s string
-			if err := stringGroup.Get(dummyCtx, "TestCaching-key", StringSink(&s)); err != nil {
+			if _, err := stringGroup.Get(dummyCtx, "TestCaching-key"); err != nil {
 				t.Fatal(err)
 			}
 		}
 	})
 	if fills != 1 {
-		t.Errorf("expected 1 cache fill; got %d, %s %s", fills, stringGroupRaw.mainCache.Metrics, stringGroupRaw.hotCache.Metrics.String())
+		t.Errorf("expected 1 cache fill; got %d, %s %s", fills, stringGroup.mainCache.Metrics, stringGroup.hotCache.Metrics.String())
 	}
 }
 
@@ -200,8 +208,7 @@ func TestCachingExpire(t *testing.T) {
 	once.Do(testSetup)
 	fills := countFills(func() {
 		for i := 0; i < 3; i++ {
-			var s string
-			if err := expireGroup.Get(dummyCtx, "TestCachingExpire-key", StringSink(&s)); err != nil {
+			if _, err := expireGroup.Get(dummyCtx, "TestCachingExpire-key"); err != nil {
 				t.Fatal(err)
 			}
 			if i == 1 {
@@ -219,12 +226,12 @@ type fakePeer struct {
 	fail bool
 }
 
-func (p *fakePeer) Get(ctx context.Context, group string, key string) ([]byte, time.Time, error) {
+func (p *fakePeer) Get(ctx context.Context, group string, key string, allocator ValueAllocator) (Value, time.Time, error) {
 	p.hits++
 	if p.fail {
 		return nil, time.Time{}, errors.New("simulated error from peer")
 	}
-	return []byte("got:" + key), time.Time{}, nil
+    return &StringValue{Value: "got:" + key}, time.Time{}, nil
 }
 
 func (p *fakePeer) Remove(_ context.Context, group string, key string) error {
@@ -262,11 +269,11 @@ func TestPeers(t *testing.T) {
 	peerList := fakePeers([]ProtoGetter{peer0, peer1, peer2, nil})
 	const cacheSize = 0 // disabled
 	localHits := 0
-	getter := func(_ context.Context, key string, dest Sink) error {
+	getter := func(_ context.Context, key string) (Value, time.Time, error) {
 		localHits++
-		return dest.SetString("got:"+key, time.Time{})
+		return &StringValue{Value: "got:"+key}, time.Time{}, nil
 	}
-	testGroup := newGroup("TestPeers-group", cacheSize, GetterFunc(getter), peerList, true)
+	testGroup := newGroup("TestPeers-group", cacheSize, GetterFunc(getter), StringValueAllocator, peerList, true)
 	run := func(name string, n int, wantSummary string) {
 		// Reset counters
 		localHits = 0
@@ -277,12 +284,12 @@ func TestPeers(t *testing.T) {
 		for i := 0; i < n; i++ {
 			key := fmt.Sprintf("key-%d", i)
 			want := "got:" + key
-			var got string
-			err := testGroup.Get(dummyCtx, key, StringSink(&got))
+            v, err := testGroup.Get(dummyCtx, key)
 			if err != nil {
 				t.Errorf("%s: error on key %q: %v", name, key, err)
 				continue
 			}
+            got := v.(*StringValue).Value
 			if got != want {
 				t.Errorf("%s: for key %q, got %q; want %q", name, key, got, want)
 			}
@@ -324,52 +331,6 @@ func TestPeers(t *testing.T) {
 	run("peer0_failing", 200, "localHits = 100, peers = 51 49 51")
 }
 
-func TestTruncatingByteSliceTarget(t *testing.T) {
-	var buf [100]byte
-	s := buf[:]
-	if err := stringGroup.Get(dummyCtx, "short", TruncatingByteSliceSink(&s)); err != nil {
-		t.Fatal(err)
-	}
-	if want := "ECHO:short"; string(s) != want {
-		t.Errorf("short key got %q; want %q", s, want)
-	}
-
-	s = buf[:6]
-	if err := stringGroup.Get(dummyCtx, "truncated", TruncatingByteSliceSink(&s)); err != nil {
-		t.Fatal(err)
-	}
-	if want := "ECHO:t"; string(s) != want {
-		t.Errorf("truncated key got %q; want %q", s, want)
-	}
-}
-
-func TestAllocatingByteSliceTarget(t *testing.T) {
-	var dst []byte
-	sink := AllocatingByteSliceSink(&dst)
-
-	inBytes := []byte("some bytes")
-    err := sink.SetBytes(inBytes, time.Time{})
-    if err != nil {
-        t.Error(err)
-    }
-	if want := "some bytes"; string(dst) != want {
-		t.Errorf("SetBytes resulted in %q; want %q", dst, want)
-	}
-	v, err := sink.view()
-	if err != nil {
-		t.Fatalf("view after SetBytes failed: %v", err)
-	}
-	if &inBytes[0] == &dst[0] {
-		t.Error("inBytes and dst share memory")
-	}
-	if &inBytes[0] == &v.b[0] {
-		t.Error("inBytes and view share memory")
-	}
-	if &dst[0] == &v.b[0] {
-		t.Error("dst and view share memory")
-	}
-}
-
 // orderedFlightGroup allows the caller to force the schedule of when
 // orig.Do will be called.  This is useful to serialize calls such
 // that singleflight cannot dedup them.
@@ -380,7 +341,7 @@ type orderedFlightGroup struct {
 	orig   flightGroup
 }
 
-func (g *orderedFlightGroup) Do(key string, fn func() (interface{}, error)) (interface{}, error) {
+func (g *orderedFlightGroup) Do(key string, fn func() (interface{}, time.Time, error)) (interface{}, time.Time, error) {
 	<-g.stage1
 	<-g.stage2
 	g.mu.Lock()
@@ -397,9 +358,9 @@ func (g *orderedFlightGroup) Lock(fn func()) {
 func TestNoDedup(t *testing.T) {
 	const testkey = "testkey"
 	const testval = "testval"
-	g := newGroup("testgroup", 1024, GetterFunc(func(_ context.Context, key string, dest Sink) error {
-		return dest.SetString(testval, time.Time{})
-	}), nil, true)
+	g := newGroup("testgroup", 1024, GetterFunc(func(_ context.Context, key string) (Value, time.Time, error) {
+		return &StringValue{Value: testval}, time.Time{}, nil
+	}), StringValueAllocator, nil, true)
 
 	orderedGroup := &orderedFlightGroup{
 		stage1: make(chan bool),
@@ -417,8 +378,9 @@ func TestNoDedup(t *testing.T) {
 	resc := make(chan string, 2)
 	for i := 0; i < 2; i++ {
 		go func() {
-			var s string
-			if err := g.Get(dummyCtx, testkey, StringSink(&s)); err != nil {
+            v, err := g.Get(dummyCtx, testkey)
+            s := (v.(*StringValue)).Value
+			if err != nil {
 				resc <- "ERROR:" + err.Error()
 				return
 			}
@@ -449,7 +411,7 @@ func TestNoDedup(t *testing.T) {
 	// upon entry, we would increment nbytes twice but the entry would
 	// only be in the cache once.
 	//const wantBytes = uint64(len(testkey) + len(testval))
-	const wantBytes = 63
+	const wantBytes = 65
 	if g.mainCache.Metrics.CostAdded() != wantBytes {
 		t.Errorf("cache has %d bytes, want %d", g.mainCache.Metrics.CostAdded(), wantBytes)
 	}
@@ -467,8 +429,8 @@ type slowPeer struct {
 	fakePeer
 }
 
-func (p *slowPeer) Get(_ context.Context, group string, key string) ([]byte, time.Time, error) {
-	return []byte("got:" + key), time.Time{}, nil
+func (p *slowPeer) Get(_ context.Context, group string, key string, allocator ValueAllocator) (Value, time.Time, error) {
+    return &StringValue{Value: "got:" + key}, time.Time{}, nil
 }
 
 func TestContextDeadlineOnPeer(t *testing.T) {
@@ -477,16 +439,15 @@ func TestContextDeadlineOnPeer(t *testing.T) {
 	peer1 := &slowPeer{}
 	peer2 := &slowPeer{}
 	peerList := fakePeers([]ProtoGetter{peer0, peer1, peer2, nil})
-	getter := func(_ context.Context, key string, dest Sink) error {
-		return dest.SetString("got:"+key, time.Time{})
+	getter := func(_ context.Context, key string) (Value, time.Time, error) {
+		return &StringValue{Value: "got:"+key}, time.Time{}, nil
 	}
-	testGroup := newGroup("TestContextDeadlineOnPeer-group", cacheSize, GetterFunc(getter), peerList, true)
+	testGroup := newGroup("TestContextDeadlineOnPeer-group", cacheSize, GetterFunc(getter), StringValueAllocator, peerList, true)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond*300)
 	defer cancel()
 
-	var got string
-	err := testGroup.Get(ctx, "test-key", StringSink(&got))
+	_, err := testGroup.Get(ctx, "test-key")
 	if err != nil {
 		if err != context.DeadlineExceeded {
 			t.Errorf("expected Get to return context deadline exceeded")

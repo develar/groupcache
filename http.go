@@ -139,11 +139,7 @@ func (p *HTTPPool) GetAll() []ProtoGetter {
 	members := p.peers.GetMembers()
 	result := make([]ProtoGetter, len(members))
 	for _, v := range members {
-		var ok bool
-		result[i], ok = v.(*httpGetter)
-		if !ok {
-			panic("cannot cast to httpGetter")
-		}
+		result[i] = v.(*httpGetter)
 		i++
 	}
 	return result
@@ -195,26 +191,31 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var b []byte
-
-	value := AllocatingByteSliceSink(&b)
-	err := group.Get(ctx, key, value)
+    value, expire, err := group.GetWithExpire(ctx, key)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
 
-	view, err := value.view()
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
-
-    if !view.e.IsZero() {
-        w.Header().Set(headerExpire, strconv.FormatUint(uint64(view.e.UnixMilli()), 10))
+    if !expire.IsZero() {
+        w.Header().Set(headerExpire, strconv.FormatUint(uint64(expire.UnixMicro()), 10))
     }
 	w.Header().Set("Content-Type", "application/x-protobuf")
-    _, _ = w.Write(b)
+
+    buffer := bytebufferpool.Get()
+    defer bytebufferpool.Put(buffer)
+
+    size := value.SizeVT()
+    if buffer.Len() < size {
+        buffer.B = make([]byte, size*2)
+    }
+
+    n, err := value.MarshalToSizedBufferVT(buffer.B[0:size])
+    if err != nil {
+   		http.Error(w, err.Error(), http.StatusInternalServerError)
+   		return
+   	}
+    _, _ = w.Write(buffer.B[0:n])
 }
 
 const headerExpire = "X-Expire"
@@ -225,12 +226,12 @@ type httpGetter struct {
 }
 
 // GetURL
-func (p *httpGetter) GetURL() string {
-	return p.url
+func (h *httpGetter) GetURL() string {
+	return h.url
 }
 
-func (p httpGetter) String() string {
-	return p.url
+func (h httpGetter) String() string {
+	return h.url
 }
 
 func (h *httpGetter) makeRequest(ctx context.Context, method string, group string, key string, out *http.Response) error {
@@ -253,7 +254,7 @@ func (h *httpGetter) makeRequest(ctx context.Context, method string, group strin
 	return nil
 }
 
-func (h *httpGetter) Get(ctx context.Context, group string, key string) ([]byte, time.Time, error) {
+func (h *httpGetter) Get(ctx context.Context, group string, key string, valueAllocator ValueAllocator) (Value, time.Time, error) {
 	var res http.Response
 	if err := h.makeRequest(ctx, http.MethodGet, group, key, &res); err != nil {
 		return nil, time.Time{}, err
@@ -264,9 +265,16 @@ func (h *httpGetter) Get(ctx context.Context, group string, key string) ([]byte,
 	if res.StatusCode != http.StatusOK {
 		return nil, expire, fmt.Errorf("server returned: %v", res.Status)
 	}
-    b, err := readAllBytes(res.Body)
+
+    buffer := bytebufferpool.Get()
+    defer bytebufferpool.Put(buffer)
+    _, err := buffer.ReadFrom(res.Body)
     if err != nil {
         return nil, expire, fmt.Errorf("reading response body: %v", err)
+    }
+
+    if err != nil {
+        return nil, expire, err
     }
 
     expireString := res.Header.Get(headerExpire)
@@ -275,9 +283,15 @@ func (h *httpGetter) Get(ctx context.Context, group string, key string) ([]byte,
         if err != nil {
             return nil, expire, fmt.Errorf("reading response body: %v", err)
         }
-        expire = time.UnixMilli(int64(expireMilli))
+        expire = time.UnixMicro(int64(expireMilli))
     }
-    return b, expire, nil
+
+    value := valueAllocator()
+    err = value.UnmarshalVT(buffer.B)
+    if err != nil {
+        return nil, expire, err
+    }
+    return value, expire, nil
 }
 
 func readAllBytes(body io.ReadCloser) ([]byte, error) {

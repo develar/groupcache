@@ -18,12 +18,16 @@ limitations under the License.
 // mechanism.
 package singleflight
 
-import "sync"
+import (
+    "sync"
+    "time"
+)
 
 // call is an in-flight or completed Do call
 type call struct {
 	wg  sync.WaitGroup
 	val interface{}
+    expire time.Time
 	err error
 }
 
@@ -38,7 +42,7 @@ type Group struct {
 // sure that only one execution is in-flight for a given key at a
 // time. If a duplicate comes in, the duplicate caller waits for the
 // original to complete and receives the same results.
-func (g *Group) Do(key string, fn func() (interface{}, error)) (interface{}, error) {
+func (g *Group) Do(key string, fn func() (interface{}, time.Time, error)) (interface{}, time.Time, error) {
 	g.mu.Lock()
 	if g.m == nil {
 		g.m = make(map[string]*call)
@@ -46,21 +50,21 @@ func (g *Group) Do(key string, fn func() (interface{}, error)) (interface{}, err
 	if c, ok := g.m[key]; ok {
 		g.mu.Unlock()
 		c.wg.Wait()
-		return c.val, c.err
+		return c.val, c.expire, c.err
 	}
 	c := new(call)
 	c.wg.Add(1)
 	g.m[key] = c
 	g.mu.Unlock()
 
-	c.val, c.err = fn()
+	c.val, c.expire, c.err = fn()
 	c.wg.Done()
 
 	g.mu.Lock()
 	delete(g.m, key)
 	g.mu.Unlock()
 
-	return c.val, c.err
+	return c.val, c.expire, c.err
 }
 
 // Lock prevents single flights from occurring for the duration

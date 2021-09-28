@@ -319,8 +319,8 @@ func (c *Consistent) LoadDistribution() map[string]float64 {
 
 // FindPartitionID returns partition id for given key.
 func (c *Consistent) FindPartitionID(key []byte) int {
-	hkey := xxh3.Hash(key)
-	return int(hkey % c.partitionCount)
+	keyHash := xxh3.Hash(key)
+	return int(keyHash % c.partitionCount)
 }
 
 // GetPartitionOwner returns the owner of the given partition.

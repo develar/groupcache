@@ -100,20 +100,21 @@ func TestHTTPPool(t *testing.T) {
 	// Dummy getter function. Gets should go to children only.
 	// The only time this process will handle a get is when the
 	// children can't be contacted for some reason.
-	getter := GetterFunc(func(ctx context.Context, key string, dest Sink) error {
-		return errors.New("parent getter called; something's wrong")
+	getter := GetterFunc(func(ctx context.Context, key string) (Value, time.Time, error) {
+		return nil, time.Time{}, errors.New("parent getter called; something's wrong")
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*5)
 	defer cancel()
 
-	g := NewGroup("httpPoolTest", 1<<20, getter)
+	g := NewGroup("httpPoolTest", 1<<20, getter, StringValueAllocator)
 
 	for _, key := range testKeys(nGets) {
-		var value string
-		if err := g.Get(ctx, key, StringSink(&value)); err != nil {
+        v, err := g.Get(ctx, key)
+		if err != nil {
 			t.Fatal(err)
 		}
+        value := v.(*StringValue).Value
 		if suffix := ":" + key; !strings.HasSuffix(value, suffix) {
 			t.Errorf("Get(%q) = %q, want value ending in %q", key, value, suffix)
 		}
@@ -125,12 +126,11 @@ func TestHTTPPool(t *testing.T) {
 	}
 	serverHits = 0
 
-	var value string
 	var key = "removeTestKey"
 
 	// Multiple gets on the same key
 	for i := 0; i < 2; i++ {
-		if err := g.Get(ctx, key, StringSink(&value)); err != nil {
+		if _, err := g.Get(ctx, key); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -146,7 +146,7 @@ func TestHTTPPool(t *testing.T) {
 	}
 
 	// Get the key again
-	if err := g.Get(ctx, key, StringSink(&value)); err != nil {
+	if _, err := g.Get(ctx, key); err != nil {
 		t.Fatal(err)
 	}
 
@@ -170,15 +170,13 @@ func beChildForTestHTTPPool(t *testing.T) {
 	p := NewHTTPPool("http://" + addrs[*peerIndex])
 	p.Set(addrToURL(addrs)...)
 
-	getter := GetterFunc(func(ctx context.Context, key string, dest Sink) error {
+	getter := GetterFunc(func(ctx context.Context, key string) (Value, time.Time, error) {
 		if _, err := http.Get(*serverAddr); err != nil {
 			t.Logf("HTTP request from getter failed with '%s'", err)
 		}
-
-		dest.SetString(strconv.Itoa(*peerIndex)+":"+key, time.Time{})
-		return nil
+        return &StringValue{Value: strconv.Itoa(*peerIndex)+":"+key}, time.Time{}, nil
 	})
-	NewGroup("httpPoolTest", 1<<20, getter)
+	NewGroup("httpPoolTest", 1<<20, getter, StringValueAllocator)
 
     log.Fatal(http.ListenAndServe(addrs[*peerIndex], p))
 }
