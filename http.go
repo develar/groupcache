@@ -20,13 +20,13 @@ import (
     "context"
     "fmt"
     "github.com/develar/groupcache/consistent"
-    "io/ioutil"
+    "io"
     "net/http"
     "net/url"
+    "strconv"
     "strings"
+    "time"
 
-    pb "github.com/develar/groupcache/groupcachepb"
-    "github.com/golang/protobuf/proto"
     "github.com/valyala/bytebufferpool"
 )
 
@@ -209,20 +209,15 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	var expireNano int64
-	if !view.e.IsZero() {
-		expireNano = view.Expire().UnixNano()
-	}
 
-	// Write the value to the response body as a proto message.
-	body, err := proto.Marshal(&pb.GetResponse{Value: b, Expire: &expireNano})
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusInternalServerError)
-		return
-	}
+    if !view.e.IsZero() {
+        w.Header().Set(headerExpire, strconv.FormatUint(uint64(view.e.UnixMilli()), 10))
+    }
 	w.Header().Set("Content-Type", "application/x-protobuf")
-	w.Write(body)
+    _, _ = w.Write(b)
 }
+
+const headerExpire = "X-Expire"
 
 type httpGetter struct {
 	getTransport func(context.Context) http.RoundTripper
@@ -238,8 +233,8 @@ func (p httpGetter) String() string {
 	return p.url
 }
 
-func (h *httpGetter) makeRequest(ctx context.Context, method string, in *pb.GetRequest, out *http.Response) error {
-	u := h.url + url.QueryEscape(in.GetGroup()) + "/" + url.QueryEscape(in.GetKey())
+func (h *httpGetter) makeRequest(ctx context.Context, method string, group string, key string, out *http.Response) error {
+	u := h.url + url.QueryEscape(group) + "/" + url.QueryEscape(key)
 	req, err := http.NewRequestWithContext(ctx, method, u, nil)
 	if err != nil {
 		return err
@@ -258,37 +253,55 @@ func (h *httpGetter) makeRequest(ctx context.Context, method string, in *pb.GetR
 	return nil
 }
 
-func (h *httpGetter) Get(ctx context.Context, in *pb.GetRequest, out *pb.GetResponse) error {
+func (h *httpGetter) Get(ctx context.Context, group string, key string) ([]byte, time.Time, error) {
 	var res http.Response
-	if err := h.makeRequest(ctx, http.MethodGet, in, &res); err != nil {
-		return err
+	if err := h.makeRequest(ctx, http.MethodGet, group, key, &res); err != nil {
+		return nil, time.Time{}, err
 	}
 	defer res.Body.Close()
+
+    var expire time.Time
 	if res.StatusCode != http.StatusOK {
-		return fmt.Errorf("server returned: %v", res.Status)
+		return nil, expire, fmt.Errorf("server returned: %v", res.Status)
 	}
-	b := bytebufferpool.Get()
-	defer bytebufferpool.Put(b)
-	_, err := b.ReadFrom(res.Body)
-	if err != nil {
-		return fmt.Errorf("reading response body: %v", err)
-	}
-	err = proto.Unmarshal(b.Bytes(), out)
-	if err != nil {
-		return fmt.Errorf("decoding response body: %v", err)
-	}
-	return nil
+    b, err := readAllBytes(res.Body)
+    if err != nil {
+        return nil, expire, fmt.Errorf("reading response body: %v", err)
+    }
+
+    expireString := res.Header.Get(headerExpire)
+    if expireString != "" {
+        expireMilli, err := strconv.ParseUint(expireString, 10, 64)
+        if err != nil {
+            return nil, expire, fmt.Errorf("reading response body: %v", err)
+        }
+        expire = time.UnixMilli(int64(expireMilli))
+    }
+    return b, expire, nil
 }
 
-func (h *httpGetter) Remove(ctx context.Context, in *pb.GetRequest) error {
+func readAllBytes(body io.ReadCloser) ([]byte, error) {
+    b := bytebufferpool.Get()
+    defer bytebufferpool.Put(b)
+    _, err := b.ReadFrom(body)
+    if err != nil {
+        return nil, err
+    }
+
+    data := make([]byte, b.Len())
+    copy(data, b.B)
+    return data, err
+}
+
+func (h *httpGetter) Remove(ctx context.Context, group string, key string) error {
 	var res http.Response
-	if err := h.makeRequest(ctx, http.MethodDelete, in, &res); err != nil {
+	if err := h.makeRequest(ctx, http.MethodDelete, group, key, &res); err != nil {
 		return err
 	}
 	defer res.Body.Close()
 
 	if res.StatusCode != http.StatusOK {
-		body, err := ioutil.ReadAll(res.Body)
+		body, err := readAllBytes(res.Body)
 		if err != nil {
 			return fmt.Errorf("while reading body response: %v", res.Status)
 		}

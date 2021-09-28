@@ -31,7 +31,6 @@ import (
 
 	"github.com/golang/protobuf/proto"
 
-	pb "github.com/develar/groupcache/groupcachepb"
 	"github.com/develar/groupcache/testpb"
 )
 
@@ -220,16 +219,15 @@ type fakePeer struct {
 	fail bool
 }
 
-func (p *fakePeer) Get(_ context.Context, in *pb.GetRequest, out *pb.GetResponse) error {
+func (p *fakePeer) Get(ctx context.Context, group string, key string) ([]byte, time.Time, error) {
 	p.hits++
 	if p.fail {
-		return errors.New("simulated error from peer")
+		return nil, time.Time{}, errors.New("simulated error from peer")
 	}
-	out.Value = []byte("got:" + in.GetKey())
-	return nil
+	return []byte("got:" + key), time.Time{}, nil
 }
 
-func (p *fakePeer) Remove(_ context.Context, in *pb.GetRequest) error {
+func (p *fakePeer) Remove(_ context.Context, group string, key string) error {
 	p.hits++
 	if p.fail {
 		return errors.New("simulated error from peer")
@@ -469,10 +467,8 @@ type slowPeer struct {
 	fakePeer
 }
 
-func (p *slowPeer) Get(_ context.Context, in *pb.GetRequest, out *pb.GetResponse) error {
-	time.Sleep(time.Second)
-	out.Value = []byte("got:" + in.GetKey())
-	return nil
+func (p *slowPeer) Get(_ context.Context, group string, key string) ([]byte, time.Time, error) {
+	return []byte("got:" + key), time.Time{}, nil
 }
 
 func TestContextDeadlineOnPeer(t *testing.T) {

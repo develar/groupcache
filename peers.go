@@ -19,15 +19,14 @@ limitations under the License.
 package groupcache
 
 import (
-	"context"
-
-	pb "github.com/develar/groupcache/groupcachepb"
+    "context"
+    "time"
 )
 
 // ProtoGetter is the interface that must be implemented by a peer.
 type ProtoGetter interface {
-	Get(context context.Context, in *pb.GetRequest, out *pb.GetResponse) error
-	Remove(context context.Context, in *pb.GetRequest) error
+	Get(context context.Context, group string, key string) ([]byte, time.Time, error)
+	Remove(context context.Context, group string, key string) error
 	// GetURL returns the peer URL
 	GetURL() string
 }

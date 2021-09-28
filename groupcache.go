@@ -33,8 +33,6 @@ import (
     "sync/atomic"
     "time"
 
-    pb "github.com/develar/groupcache/groupcachepb"
-
     "github.com/dgraph-io/ristretto"
     "go.uber.org/zap"
 )
@@ -420,7 +418,7 @@ func (g *Group) load(ctx context.Context, key string, dest Sink) (value ByteView
         expire := value.Expire()
         var ttl time.Duration
         if !expire.IsZero() {
-            ttl = expire.Sub(time.Now())
+            ttl = time.Until(expire)
         }
         g.populateCache(key, value, g.mainCache, ttl)
 		return value, nil
@@ -440,27 +438,20 @@ func (g *Group) getLocally(ctx context.Context, key string, dest Sink) (ByteView
 }
 
 func (g *Group) getFromPeer(ctx context.Context, peer ProtoGetter, key string) (ByteView, error) {
-	req := &pb.GetRequest{
-		Group: &g.name,
-		Key:   &key,
-	}
-	res := &pb.GetResponse{}
-	err := peer.Get(ctx, req, res)
+	b, expire, err := peer.Get(ctx, g.name, key)
 	if err != nil {
 		return ByteView{}, err
 	}
 
-	var expire time.Time
     var ttl time.Duration
-	if res.Expire != nil && *res.Expire != 0 {
-		expire = time.Unix(*res.Expire/int64(time.Second), *res.Expire%int64(time.Second))
-        ttl = expire.Sub(time.Now())
+	if !expire.IsZero() {
+        ttl = time.Until(expire)
 		if ttl <= 0 {
 			return ByteView{}, errors.New("peer returned expired value")
 		}
 	}
 
-	value := ByteView{b: res.Value, e: expire}
+	value := ByteView{b: b, e: expire}
 
 	// Always populate the hot cache
 	g.populateCache(key, value, g.hotCache, ttl)
@@ -468,11 +459,7 @@ func (g *Group) getFromPeer(ctx context.Context, peer ProtoGetter, key string) (
 }
 
 func (g *Group) removeFromPeer(ctx context.Context, peer ProtoGetter, key string) error {
-	req := &pb.GetRequest{
-		Group: &g.name,
-		Key:   &key,
-	}
-	return peer.Remove(ctx, req)
+	return peer.Remove(ctx, g.name, key)
 }
 
 func (g *Group) lookupCache(key string) (ByteView, bool) {
