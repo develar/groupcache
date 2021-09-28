@@ -61,10 +61,10 @@ func (f GetterFunc) Get(ctx context.Context, key string, dest Sink) error {
 	return f(ctx, key, dest)
 }
 
-var (
-	mu     sync.RWMutex
-	groups = make(map[string]*Group)
 
+var groups sync.Map
+
+var (
 	initPeerServerOnce sync.Once
 	initPeerServer     func()
 )
@@ -72,10 +72,8 @@ var (
 // GetGroup returns the named group previously created with NewGroup, or
 // nil if there's no such group.
 func GetGroup(name string) *Group {
-	mu.RLock()
-	g := groups[name]
-	mu.RUnlock()
-	return g
+	g, _ := groups.Load(name)
+	return g.(*Group)
 }
 
 // NewGroup creates a coordinated group-aware Getter from a Getter.
@@ -93,9 +91,7 @@ func NewGroup(name string, cacheBytes int64, getter Getter) *Group {
 
 // DeregisterGrorup removes group from group pool
 func DeregisterGroup(name string) {
-	mu.Lock()
-	delete(groups, name)
-	mu.Unlock()
+    groups.Delete(name)
 }
 
 // If peers is nil, the peerPicker is called via a sync.Once to initialize it.
@@ -103,10 +99,9 @@ func newGroup(name string, cacheBytes int64, getter Getter, peers PeerPicker, ca
 	if getter == nil {
 		panic("nil Getter")
 	}
-	mu.Lock()
-	defer mu.Unlock()
+
 	initPeerServerOnce.Do(callInitPeerServer)
-	if _, dup := groups[name]; dup {
+	if _, dup := groups.Load(name); dup {
 		panic("duplicate registration of group " + name)
 	}
 
@@ -132,7 +127,7 @@ func newGroup(name string, cacheBytes int64, getter Getter, peers PeerPicker, ca
     if fn := newGroupHook; fn != nil {
         fn(g)
     }
-    groups[name] = g
+    groups.Store(name, g)
     return g
 }
 
