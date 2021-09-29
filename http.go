@@ -22,7 +22,6 @@ import (
     "github.com/develar/groupcache/consistent"
     "io"
     "net/http"
-    "net/url"
     "strconv"
     "strings"
     "time"
@@ -162,15 +161,15 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !strings.HasPrefix(r.URL.Path, p.opts.BasePath) {
 		panic("HTTPPool serving unexpected path: " + r.URL.Path)
 	}
-	parts := strings.SplitN(r.URL.Path[len(p.opts.BasePath):], "/", 2)
-	if len(parts) != 2 {
+
+    groupName := r.Header[headerGroup][0]
+   	key := r.Header[headerKey][0]
+	if groupName == "" || key == "" {
 		http.Error(w, "bad request", http.StatusBadRequest)
 		return
 	}
-	groupName := parts[0]
-	key := parts[1]
 
-	// Fetch the value for this group/key.
+	// fetch the value for this group/key.
 	group := GetGroup(groupName)
 	if group == nil {
 		http.Error(w, "no such group: "+groupName, http.StatusNotFound)
@@ -198,15 +197,15 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
     if !expire.IsZero() {
-        w.Header().Set(headerExpire, strconv.FormatUint(uint64(expire.UnixMicro()), 10))
+        w.Header()[headerExpire] = []string{strconv.FormatUint(uint64(expire.UnixMicro()), 10)}
     }
-	w.Header().Set("Content-Type", "application/x-protobuf")
+    w.Header()["Content-Type"] = []string{"application/x-protobuf"}
 
     buffer := bytebufferpool.Get()
     defer bytebufferpool.Put(buffer)
 
     size := value.SizeVT()
-    if buffer.Len() < size {
+    if cap(buffer.B) < size {
         buffer.B = make([]byte, size*2)
     }
 
@@ -215,10 +214,13 @@ func (p *HTTPPool) ServeHTTP(w http.ResponseWriter, r *http.Request) {
    		http.Error(w, err.Error(), http.StatusInternalServerError)
    		return
    	}
+    w.Header()["Content-Length"] = []string{strconv.Itoa(n)}
     _, _ = w.Write(buffer.B[0:n])
 }
 
 const headerExpire = "X-Expire"
+const headerGroup = "X-Group"
+const headerKey = "X-Key"
 
 type httpGetter struct {
 	getTransport func(context.Context) http.RoundTripper
@@ -235,8 +237,9 @@ func (h httpGetter) String() string {
 }
 
 func (h *httpGetter) makeRequest(ctx context.Context, method string, group string, key string, out *http.Response) error {
-	u := h.url + url.QueryEscape(group) + "/" + url.QueryEscape(key)
-	req, err := http.NewRequestWithContext(ctx, method, u, nil)
+	req, err := http.NewRequestWithContext(ctx, method, h.url, nil)
+    req.Header.Set(headerGroup, group)
+    req.Header.Set(headerKey, key)
 	if err != nil {
 		return err
 	}
