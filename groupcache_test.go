@@ -40,7 +40,7 @@ var (
 
 	stringc = make(chan string)
 
-	dummyCtx context.Context
+    dummyCtx = context.Background()
 
 	// cacheFills is the number of times stringGroup or
 	// protoGroup's Getter have been called. Read using the

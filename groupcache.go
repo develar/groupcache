@@ -29,6 +29,8 @@ import (
     "errors"
     "github.com/develar/groupcache/singleflight"
     "github.com/zeebo/xxh3"
+    "go.opentelemetry.io/otel/attribute"
+    "go.opentelemetry.io/otel/trace"
     "strconv"
     "sync"
     "sync/atomic"
@@ -38,7 +40,7 @@ import (
     "go.uber.org/zap"
 )
 
-var logger *zap.Logger = zap.NewNop()
+var logger = zap.NewNop()
 
 // SetLogger must be called before calling other methods, effective only on init
 func SetLogger(log *zap.Logger) {
@@ -115,6 +117,7 @@ func newGroup(name string, cacheBytes int64, getter Getter, valueAllocator Value
         peers:       peers,
         loadGroup:   &singleflight.Group{},
         removeGroup: &singleflight.Group{},
+        Tracer: trace.NewNoopTracerProvider().Tracer("groupcache"),
     }
 
     err := g.updateCacheSize(cacheBytes, cacheMetrics)
@@ -231,6 +234,8 @@ type Group struct {
 
     // Stats are statistics on the group.
     Stats Stats
+
+    Tracer trace.Tracer
 }
 
 // flightGroup is defined as an interface which flightgroup.Group
@@ -266,7 +271,10 @@ func (g *Group) initPeers() {
 }
 
 func (g *Group) Get(ctx context.Context, key string) (Value, error) {
-	g.peersOnce.Do(g.initPeers)
+    childContext, span := g.Tracer.Start(ctx, "get", trace.WithAttributes(attribute.Key("group").String(g.name), attribute.Key("key").String(key)))
+    defer span.End()
+
+    g.peersOnce.Do(g.initPeers)
 	g.Stats.Gets.Add(1)
 
     value := g.lookupCache(key)
@@ -275,7 +283,7 @@ func (g *Group) Get(ctx context.Context, key string) (Value, error) {
     }
 
     var err error
-    value, _, err = g.load(ctx, key, false)
+    value, _, err = g.load(childContext, key, false)
     if err != nil {
         return nil, err
     }
@@ -283,6 +291,9 @@ func (g *Group) Get(ctx context.Context, key string) (Value, error) {
 }
 
 func (g *Group) GetWithExpire(ctx context.Context, key string) (Value, time.Time, error) {
+    childContext, span := g.Tracer.Start(ctx, "get", trace.WithAttributes(attribute.Key("group").String(g.name), attribute.Key("key").String(key)))
+    defer span.End()
+
 	g.peersOnce.Do(g.initPeers)
 	g.Stats.Gets.Add(1)
 
@@ -291,7 +302,7 @@ func (g *Group) GetWithExpire(ctx context.Context, key string) (Value, time.Time
         return value, expire, nil
     }
 
-    return g.load(ctx, key, true)
+    return g.load(childContext, key, true)
 }
 
 func (g *Group) lookupCacheWithExpire(key string) (Value, time.Time) {
@@ -372,7 +383,7 @@ func (g *Group) Remove(ctx context.Context, key string) error {
 func (g *Group) load(ctx context.Context, key string, expireIsRequired bool) (Value, time.Time, error) {
 	g.Stats.Loads.Add(1)
     value, expire, err := g.loadGroup.Do(key, func() (interface{}, time.Time, error) {
-        // Check the cache again because singleflight can only dedup calls
+        // Check the cache again because singleflight can only dedupe calls
         // that overlap concurrently.  It's possible for 2 concurrent
         // requests to miss the cache, resulting in 2 load() calls.  An
         // unfortunate goroutine scheduling would result in this callback
@@ -404,48 +415,52 @@ func (g *Group) load(ctx context.Context, key string, expireIsRequired bool) (Va
             return value, expire, nil
         }
 
+        childContext, span := g.Tracer.Start(ctx, "load", trace.WithAttributes(attribute.Key("group").String(g.name), attribute.Key("key").String(key)))
+        defer span.End()
+        ctx = childContext
+
         g.Stats.LoadsDeduped.Add(1)
-        var err error
         if peer, ok := g.peers.PickPeer(key); ok {
+            var err error
             // metrics duration start
             start := time.Now()
             value, expire, err = g.getFromPeer(ctx, peer, key)
-            // metrics duration compute
-            duration := int64(time.Since(start)) / int64(time.Millisecond)
 
-            // metrics only store the slowest duration
-            if g.Stats.GetFromPeersLatencyLower.Get() < duration {
-                g.Stats.GetFromPeersLatencyLower.Store(duration)
-            }
+            var ttl time.Duration
+        	if err == nil && !expire.IsZero() {
+                ttl = time.Until(expire)
+        		if ttl <= 0 {
+                    err = errors.New("peer returned expired value")
+        		}
+        	}
 
             if err == nil {
+                // metrics duration compute
+                duration := int64(time.Since(start)) / int64(time.Millisecond)
+
+                // metrics only store the slowest duration
+                if g.Stats.GetFromPeersLatencyLower.Get() < duration {
+                    g.Stats.GetFromPeersLatencyLower.Store(duration)
+                }
+
+                // always populate the hot cache
+                g.populateCache(key, value, g.hotCache, ttl)
+
                 g.Stats.PeerLoads.Add(1)
                 return value, expire, nil
-            }
+            } else {
+                logger.Error("error retrieving key from peer", zap.String("peer", peer.GetURL()), zap.Error(err), zap.String("key", key))
 
-            logger.Error("error retrieving key from peer", zap.String("peer", peer.GetURL()), zap.Error(err), zap.String("key", key))
-
-            g.Stats.PeerErrors.Add(1)
-            if ctx != nil && ctx.Err() != nil {
-                // return here without attempting to get locally since the context is no longer valid
-                return nil, expire, err
+                g.Stats.PeerErrors.Add(1)
+                if ctx != nil && ctx.Err() != nil {
+                    // return here without attempting to get locally since the context is no longer valid
+                    return nil, expire, err
+                }
             }
         }
 
         // get locally - key belongs to us or error on getting from peer
-        value, expire, err = g.getter.Get(ctx, key)
-        if err != nil {
-            g.Stats.LocalLoadErrs.Add(1)
-            return nil, expire, err
-        }
-
-        g.Stats.LocalLoads.Add(1)
-        var ttl time.Duration
-        if !expire.IsZero() {
-            ttl = time.Until(expire)
-        }
-        g.populateCache(key, value, g.mainCache, ttl)
-        return value, expire, nil
+        return g.getLocally(key, ctx)
     })
 
     if err != nil {
@@ -454,23 +469,34 @@ func (g *Group) load(ctx context.Context, key string, expireIsRequired bool) (Va
     return value.(Value), expire, nil
 }
 
-func (g *Group) getFromPeer(ctx context.Context, peer ProtoGetter, key string) (Value, time.Time, error) {
-    value, expire, err := peer.Get(ctx, g.name, key, g.valueAllocator)
-	if err != nil {
-		return nil, expire, err
-	}
+func (g *Group) getLocally(key string, ctx context.Context) (Value, time.Time, error) {
+    childContext, span := g.Tracer.Start(ctx, "getLocally")
+    // attributes are not set - reduce impact, already reported as part of a parent span
+    defer span.End()
 
+    value, expire, err := g.getter.Get(childContext, key)
+    if err != nil {
+        g.Stats.LocalLoadErrs.Add(1)
+        return nil, expire, err
+    }
+
+    g.Stats.LocalLoads.Add(1)
     var ttl time.Duration
-	if !expire.IsZero() {
+    if !expire.IsZero() {
         ttl = time.Until(expire)
-		if ttl <= 0 {
-			return nil, expire, errors.New("peer returned expired value")
-		}
-	}
+    }
+    g.populateCache(key, value, g.mainCache, ttl)
+    return value, expire, nil
+}
 
-	// always populate the hot cache
-	g.populateCache(key, value, g.hotCache, ttl)
-	return value, expire, nil
+func (g *Group) getFromPeer(ctx context.Context, peer ProtoGetter, key string) (Value, time.Time, error) {
+    childContext, span := g.Tracer.Start(ctx, "getFromPeer", trace.WithAttributes(
+        attribute.Key("group").String(g.name),
+        attribute.Key("peer").String(peer.GetURL()),
+        attribute.Key("key").String(key),
+    ))
+    defer span.End()
+    return peer.Get(childContext, g.name, key, g.valueAllocator)
 }
 
 func (g *Group) removeFromPeer(ctx context.Context, peer ProtoGetter, key string) error {
