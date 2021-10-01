@@ -28,6 +28,7 @@ import (
     "context"
     "errors"
     "github.com/develar/groupcache/singleflight"
+    "github.com/zeebo/xxh3"
     "strconv"
     "sync"
     "sync/atomic"
@@ -128,6 +129,12 @@ func newGroup(name string, cacheBytes int64, getter Getter, valueAllocator Value
     return g
 }
 
+var keyToCacheHash = func(key interface{}) (uint64, uint64) {
+    // our key is always string - avoid guessing and use xxh3
+    h := xxh3.Hash128([]byte(key.(string)))
+    return h.Lo, h.Hi
+}
+
 // not thread safe, for init and tests only
 func (g *Group) updateCacheSize(cacheBytes int64, cacheMetrics bool) error {
     g.cacheBytes = cacheBytes
@@ -139,6 +146,7 @@ func (g *Group) updateCacheSize(cacheBytes int64, cacheMetrics bool) error {
             MaxCost:     cacheBytes,
             BufferItems: 64,
             Metrics:     cacheMetrics,
+            KeyToHash:   keyToCacheHash,
         })
         if err != nil {
             panic(err)
@@ -148,6 +156,7 @@ func (g *Group) updateCacheSize(cacheBytes int64, cacheMetrics bool) error {
             MaxCost:     cacheBytes / 8,
             BufferItems: 64,
             Metrics:     cacheMetrics,
+            KeyToHash:   keyToCacheHash,
         })
     } else {
         g.mainCache = nil
@@ -418,8 +427,7 @@ func (g *Group) load(ctx context.Context, key string, expireIsRequired bool) (Va
 
             g.Stats.PeerErrors.Add(1)
             if ctx != nil && ctx.Err() != nil {
-                // Return here without attempting to get locally
-                // since the context is no longer valid
+                // return here without attempting to get locally since the context is no longer valid
                 return nil, expire, err
             }
         }
